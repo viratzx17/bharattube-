@@ -160,8 +160,7 @@ export default function WatchPage({
   const fetchComments = useCallback(async () => {
     try {
       const res = await fetch(
-        // Latest backend: GET /comments/:videoId (verified live).
-        apiUrl(`/comments/${encodeURIComponent(videoId)}?sort=${commentSort}`),
+        apiUrl(`/comments?videoId=${videoId}&sort=${commentSort}`),
         { cache: "no-store" }
       );
 
@@ -270,8 +269,7 @@ export default function WatchPage({
 
     setPostingComment(true);
     try {
-      // Latest backend: POST /comments/:videoId (auth-protected, verified live).
-      const res = await fetch(apiUrl(`/comments/${encodeURIComponent(videoId)}`), {
+      const res = await fetch(apiUrl("/comments"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -279,9 +277,6 @@ export default function WatchPage({
           videoId,
           content,
           parentId,
-          // Backend comment.controller addComment reads { text, parentComment }.
-          text: content,
-          ...(parentId ? { parentComment: parentId } : {}),
         }),
       });
       if (res.ok) {
@@ -293,9 +288,6 @@ export default function WatchPage({
         }
         await fetchComments();
         showToast(parentId ? "Reply added" : "Comment posted", "success");
-      } else {
-        const err = await res.json().catch(() => null);
-        showToast((err && (err.message || err.error)) || "Could not post the comment.", "error");
       }
     } finally {
       setPostingComment(false);

@@ -83,64 +83,11 @@ async function readError(res: Response, fallback: string): Promise<string> {
  * Returns extra publish fields (title/description/etc.) so the backend can
  * create the video in ONE request when it expects that.
  */
-/**
- * Real, human-readable error from a backend error body. express-validator
- * replies { message: "Validation Failed", errors: [{ msg, path }] } — the
- * details are what the user needs to see, not just "Validation Failed".
- */
-function backendErrorMessage(b: Record<string, any>, fallback: string): string {
-  const base = b.message || b.error || fallback;
-  if (Array.isArray(b.errors) && b.errors.length) {
-    const details = b.errors
-      .map((e: any) =>
-        typeof e === "string" ? e : [e?.path || e?.param, e?.msg || e?.message].filter(Boolean).join(": ")
-      )
-      .filter(Boolean)
-      .join(", ");
-    if (details) return `${base}: ${details}`;
-  }
-  return base;
-}
-
-/**
- * The backend's multer fileFilter accepts files ONLY by name extension
- * (/jpg|jpeg|png|webp/ for images, /mp4|mov|avi|mkv|webm/ for videos).
- * Android pickers often give names without an extension, so send a name the
- * backend accepts, derived from the real MIME type. Content is unchanged.
- */
-function backendSafeName(f: File): string {
-  const name = f.name || "upload";
-  const ext = (name.match(/\.([a-z0-9]+)$/i)?.[1] || "").toLowerCase();
-  const isImage = (f.type || "").startsWith("image/");
-  const allowed = isImage
-    ? ["jpg", "jpeg", "png", "webp"]
-    : ["mp4", "mov", "avi", "mkv", "webm"];
-  if (allowed.includes(ext)) return name;
-  const t = (f.type || "").toLowerCase();
-  const byMime = isImage
-    ? t.includes("png") ? "png" : t.includes("webp") ? "webp" : "jpg"
-    : t.includes("webm") ? "webm"
-    : t.includes("quicktime") ? "mov"
-    : t.includes("matroska") ? "mkv"
-    : t.includes("avi") ? "avi"
-    : "mp4";
-  return `${name.replace(/\.[a-z0-9]+$/i, "") || "upload"}.${byMime}`;
-}
-
-/** True only when the backend rejected the multipart FIELD NAME (multer). */
-function isFieldNameRejection(message: string): boolean {
-  return /unexpected field|no file|file (is )?required|video (file )?(is )?required|missing file/i.test(
-    message || ""
-  );
-}
-
 function uploadFileExternal(
   file: File,
   opts: {
     onProgress?: (p: UploadProgress) => void;
     extraFields?: Record<string, string>;
-    /** Additional files sent in the SAME request (e.g. { thumbnail: File }). */
-    extraFiles?: Record<string, File | null | undefined>;
   }
 ): UploadHandle {
   let xhr: XMLHttpRequest | null = null;
@@ -153,8 +100,7 @@ function uploadFileExternal(
 
   const promise = (async (): Promise<UploadedAsset> => {
     const isImage = file.type.startsWith("image/");
-    // Backend multer limit (upload.middleware.js): 500 MB per file.
-    const cap = Math.min(isImage ? MAX_IMAGE_BYTES : MAX_VIDEO_BYTES, 500 * 1024 * 1024);
+    const cap = isImage ? MAX_IMAGE_BYTES : MAX_VIDEO_BYTES;
     if (file.size > cap) {
       throw new Error(
         `This file is too large. Maximum size is ${Math.round(cap / (1024 * 1024))} MB.`
@@ -172,33 +118,19 @@ function uploadFileExternal(
     // strict multer `.single("video")` parser ("Unexpected field" → 400), so we
     // send exactly ONE file field and fall through candidates on failure:
     //   404 -> next endpoint, 400/422 -> next field name, 401/403 -> auth error.
-    // Backend (video.routes.js): upload.fields([{ name: "video" }, { name: "thumbnail" }]).
-    const FIELD_NAMES = ["video"];
+    const FIELD_NAMES = ["video", "file", "videoFile"];
     let fieldError = "";
-
-    const extraFiles = Object.entries(opts.extraFiles || {}).filter(
-      (entry): entry is [string, File] => entry[1] instanceof File
-    );
-    // With extra files, a strict single-file parser may reject THEM
-    // ("Unexpected field"); retry that field name once without the extras.
-    const EXTRA_MODES = extraFiles.length ? [true, false] : [false];
 
     let lastError = "Upload failed. Please try again.";
     outer: for (const endpoint of videoUploadCandidates) {
       for (const fieldName of FIELD_NAMES) {
-        for (const withExtras of EXTRA_MODES) {
         if (cancelled) throw new UploadCancelledError();
 
-        // Text fields FIRST: multer only exposes req.body fields that arrive
-        // before the file part, and the backend validates them on create.
         const form = new FormData();
+        form.append(fieldName, file);
         for (const [k, v] of Object.entries(opts.extraFields || {})) {
           if (v !== undefined && v !== null) form.append(k, String(v));
         }
-        if (withExtras) {
-          for (const [k, f] of extraFiles) form.append(k, f, backendSafeName(f));
-        }
-        form.append(fieldName, file, backendSafeName(file));
 
       const result = await new Promise<
         { ok: true; data: UploadedAsset } | { ok: false; status: number; message: string }
@@ -232,29 +164,13 @@ function uploadFileExternal(
           }
           if (status >= 200 && status < 300) {
             const b = (body || {}) as Record<string, any>;
-            // { success, data: <video> } | { data: { video } } | { video } | <video>
-            const node =
-              (b.data && typeof b.data === "object" && (b.data.video || b.data)) ||
-              b.video ||
-              b;
+            const node = b.data || b.video || b;
             const url =
               node.url || node.videoUrl || node.secure_url || node.location || "";
-            const id = node.id || node._id || node.publicId || "";
-            if (!id && !url) {
-              // 2xx but nothing identifies a stored video — do not claim success.
-              resolve({
-                ok: false,
-                status,
-                message:
-                  b.message ||
-                  "The server did not confirm that the video was saved. Please try again.",
-              });
-              return;
-            }
             resolve({
               ok: true,
               data: {
-                id: String(id || url),
+                id: String(node.id || node._id || node.publicId || url),
                 url,
                 filename: file.name,
                 mimeType: file.type || "application/octet-stream",
@@ -266,10 +182,7 @@ function uploadFileExternal(
             resolve({
               ok: false,
               status,
-              message: backendErrorMessage(
-                b,
-                (xhr!.responseText || "").trim().slice(0, 200) || `Upload failed (HTTP ${status}).`
-              ),
+              message: b.message || b.error || "Upload failed.",
             });
           }
         };
@@ -283,36 +196,31 @@ function uploadFileExternal(
 
       if (result.ok) return result.data;
       if (result.message === "aborted") throw new UploadCancelledError();
-      if (cancelled) throw new UploadCancelledError();
       if (result.status === 0) {
         throw new Error(
-          "The connection to the server was lost before it confirmed the upload. Please check your connection and try again."
+          "We couldn't reach the server. Please check your connection and try again."
         );
       }
-      if (result.status === 404 && /route '.*' not found/i.test(result.message)) {
+      if (result.status === 404) {
         lastError = "Upload service was not found on the server.";
         continue outer; // this endpoint does not exist
       }
       if (result.status === 401 || result.status === 403) {
         throw new Error(
-          result.status === 403 && result.message
-            ? result.message
-            : "Your session has expired. Please sign in again, then retry the upload."
+          "Your session has expired. Please sign in again, then retry the upload."
         );
       }
       if (result.status === 413) {
         throw new Error("This file is too large for the server.");
       }
-      if (isFieldNameRejection(result.message)) {
+      if (result.status === 400 || result.status === 422) {
         // Endpoint exists but rejected this multipart field name (strict
-        // multer-style parser). Try the next variant for this endpoint.
+        // multer-style parsers). Try the next field name for this endpoint.
         fieldError = result.message || lastError;
         continue;
       }
-      // Real server error after the bytes arrived (validation, storage,
-      // database…) — show it exactly; re-uploading will not help.
+      // Endpoint exists but the request is otherwise invalid — no retry helps.
       throw new Error(result.message || lastError);
-        }
       }
     }
     // Prefer the field-specific rejection if an endpoint rejected the field.
@@ -331,8 +239,6 @@ export function uploadFile(
     maxRetriesPerChunk?: number;
     /** Publish metadata for one-shot external-backend uploads. */
     extraFields?: Record<string, string>;
-    /** Extra files for the same one-shot request (e.g. { thumbnail }). */
-    extraFiles?: Record<string, File | null | undefined>;
   } = {}
 ): UploadHandle {
   // External backend: single multipart POST to the real video endpoint.
@@ -340,7 +246,6 @@ export function uploadFile(
     return uploadFileExternal(file, {
       onProgress: opts.onProgress,
       extraFields: opts.extraFields,
-      extraFiles: opts.extraFiles,
     });
   }
 

@@ -28,7 +28,6 @@ import {
 import { formatCount, formatDuration, formatTimeAgo } from "@/lib/format";
 import { apiUrl, unwrapList } from "@/lib/api-config";
 import { adaptVideos } from "@/lib/backend-adapter";
-import { getSessionToken } from "@/lib/client";
 
 type Tab = "videos" | "shorts";
 
@@ -56,7 +55,7 @@ function VisibilityBadge({ visibility }: { visibility: string }) {
 }
 
 function MyVideosContent() {
-  const { user, openUploadModal, openPlaylistModal, showToast, triggerFeedRefresh } =
+  const { openUploadModal, openPlaylistModal, showToast, triggerFeedRefresh } =
     useApp();
   const router = useRouter();
   const searchParams = useSearchParams();
@@ -82,33 +81,16 @@ function MyVideosContent() {
     setLoading(true);
     setError("");
     try {
-      // Backend (studio.routes.js): GET /studio/videos → the signed-in user's
-      // OWN videos incl. private/unlisted and shorts ({ success, videos }).
-      // GET /videos ignores userId and returns everyone's public videos.
-      if (user?.id == null) {
-        setVideos([]);
-        return;
-      }
-      const token = getSessionToken();
-      const res = await fetch(apiUrl("/studio/videos?limit=100"), {
-        cache: "no-store",
-        credentials: "include",
-        headers: token ? { Authorization: `Bearer ${token}` } : {},
-      });
-      const data = await res.json().catch(() => null);
-      if (res.status === 404) {
-        // "Channel not found" → no channel yet, therefore no videos.
-        setVideos([]);
-        return;
-      }
-      if (!res.ok) throw new Error(data?.message || data?.error || "Failed to load");
+      const res = await fetch(apiUrl("/videos?feed=my_videos"), { cache: "no-store" });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.error || "Failed to load");
       setVideos(adaptVideos(data) as unknown as VideoItem[]);
     } catch {
       setError("Could not load your videos.");
     } finally {
       setLoading(false);
     }
-  }, [user?.id]);
+  }, []);
 
   useEffect(() => {
     load();

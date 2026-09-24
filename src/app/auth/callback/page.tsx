@@ -4,8 +4,6 @@ import React, { Suspense, useEffect, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import { Loader2, AlertCircle } from "lucide-react";
-import { saveSessionToken, getSessionToken } from "@/lib/client";
-import { useApp } from "@/context/AppContext";
 
 /**
  * BharatTube OAuth callback.
@@ -32,33 +30,10 @@ function CallbackContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const [failed, setFailed] = useState(false);
-  const { refreshUser } = useApp();
 
   useEffect(() => {
     let cancelled = false;
-    const liveParams =
-      typeof window !== "undefined" ? new URLSearchParams(window.location.search) : null;
-    // Backend failure redirect (verified live):
-    //   /auth/google/callback?error=google_login_cancelled
-    // Never fall back to a stored token here — surface the real error on /login
-    // (AppContext turns ?error= into the existing toast).
-    const oauthError = searchParams.get("error") || liveParams?.get("error");
-    if (oauthError) {
-      router.replace(`/login?error=${encodeURIComponent(oauthError)}`);
-      return () => {
-        cancelled = true;
-      };
-    }
-
-    // The backend redirects to /auth/google/callback?token=<JWT>. AppContext
-    // may already have consumed (and stripped) it from the URL on boot, in
-    // which case it is already saved — use that instead of bouncing to login.
-    const token =
-      searchParams.get("token") ||
-      (typeof window !== "undefined"
-        ? new URLSearchParams(window.location.search).get("token")
-        : null) ||
-      getSessionToken();
+    const token = searchParams.get("token");
 
     if (!token) {
       // No token -> login
@@ -72,15 +47,11 @@ function CallbackContent() {
     // not call setState synchronously (avoids a cascading render).
     void Promise.resolve()
       .then(() => {
-        // Write to EVERY token store (memory, sessionStorage, localStorage
-        // "bharattube_token", cookie). Writing only localStorage let a stale
-        // in-memory/sessionStorage token win, so /auth/me got the OLD token → 401.
-        saveSessionToken(token);
         localStorage.setItem(TOKEN_KEY, token);
       })
-      .then(() => refreshUser()) // GET /auth/me with the NEW token
       .then(() => {
         if (cancelled) return;
+        // Go home; app boot then calls GET /api/v1/auth/me with the saved token.
         router.replace("/");
       })
       .catch((err) => {
@@ -91,7 +62,6 @@ function CallbackContent() {
     return () => {
       cancelled = true;
     };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [router, searchParams]);
 
   if (failed) {

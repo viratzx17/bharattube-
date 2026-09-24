@@ -90,10 +90,7 @@ export function UploadStudio({ onClose }: { onClose: () => void }) {
   const [playlistId, setPlaylistId] = useState("");
   const [playlists, setPlaylists] = useState<Array<{ id: number; title: string }>>([]);
 
-  const [publishedId, setPublishedId] = useState<string | number | null>(null);
-  // External backend: the thumbnail travels as a file in the SAME create
-  // request as the video (the backend has no standalone upload route).
-  const thumbFileRef = useRef<File | null>(null);
+  const [publishedId, setPublishedId] = useState<number | null>(null);
 
   const videoInputRef = useRef<HTMLInputElement>(null);
   const thumbInputRef = useRef<HTMLInputElement>(null);
@@ -282,24 +279,13 @@ export function UploadStudio({ onClose }: { onClose: () => void }) {
       setTitle(base ? base.charAt(0).toUpperCase() + base.slice(1) : "");
     }
 
-    if (USE_EXTERNAL_BACKEND) {
-      // The backend's only create route (POST /videos) needs the video file
-      // AND its details in ONE request, so the upload runs on Publish.
-      setUploadState("idle");
-      setProgress(null);
-      setErrorMessage("");
-    } else {
-      // Start uploading immediately while the user fills in details.
-      beginUpload(f);
-    }
+    // Start uploading immediately while the user fills in details.
+    beginUpload(f);
 
     // Probe metadata + auto thumbnail (skip duration re-probe if already known).
     const { duration: d, thumb } = await probeVideo(f, url);
     if (d) setDuration(d);
-    if (thumb && !thumbnailUrl && USE_EXTERNAL_BACKEND) {
-      thumbFileRef.current = thumb;
-      setThumbnailUrl(URL.createObjectURL(thumb));
-    } else if (thumb && !thumbnailUrl) {
+    if (thumb && !thumbnailUrl) {
       try {
         const asset = await uploadSmallFile(thumb);
         setThumbnailUrl(asset.url);
@@ -325,12 +311,6 @@ export function UploadStudio({ onClose }: { onClose: () => void }) {
     }
     if (f.size > MAX_IMAGE_BYTES) {
       showToast(`Thumbnail must be smaller than ${formatBytes(MAX_IMAGE_BYTES)}.`, "error");
-      return;
-    }
-    if (USE_EXTERNAL_BACKEND) {
-      thumbFileRef.current = f;
-      setThumbnailUrl(URL.createObjectURL(f));
-      showToast("Thumbnail updated", "success");
       return;
     }
     setThumbBusy(true);
@@ -365,127 +345,8 @@ export function UploadStudio({ onClose }: { onClose: () => void }) {
     setErrorMessage("Upload cancelled.");
   };
 
-  /**
-   * External backend publish: ONE multipart POST /videos carrying the video,
-   * thumbnail and details. Success is claimed only after the server responds
-   * with the created video record — reaching 100% bytes is not success.
-   */
-  const publishExternal = async () => {
-    if (!file || publishingRef.current) return;
-    if (!title.trim()) {
-      setErrorMessage("Please enter a title for your video.");
-      return;
-    }
-    // Backend rule (video.validator.js): title 5–120 chars. Checked BEFORE
-    // sending so the whole file is not uploaded just to be rejected.
-    if (title.trim().length < 5 || title.trim().length > 120) {
-      setErrorMessage("Title must be between 5 and 120 characters.");
-      return;
-    }
-    if (!thumbnailUrl && !isShort) {
-      setErrorMessage("Please choose a thumbnail for your video.");
-      return;
-    }
-
-    publishingRef.current = true;
-    setUploadState("uploading");
-    setProgress(null);
-    setErrorMessage("");
-
-    // Backend requires a channel ("Create your channel first") but only checks
-    // AFTER receiving the full file — verify first via GET /channel/me.
-    try {
-      const token = getSessionToken();
-      const chRes = await fetch(apiUrl("/channel/me"), {
-        cache: "no-store",
-        credentials: "include",
-        headers: token ? { Authorization: `Bearer ${token}` } : {},
-      });
-      if (chRes.status === 404) {
-        setUploadState("error");
-        setErrorMessage(
-          "Create your channel first (You → Edit channel), then upload your video."
-        );
-        publishingRef.current = false;
-        return;
-      }
-      if (chRes.status === 401) {
-        setUploadState("error");
-        setErrorMessage("Your session has expired. Please sign in again, then retry the upload.");
-        publishingRef.current = false;
-        return;
-      }
-    } catch {
-      /* network hiccup: let the upload request report the real error */
-    }
-
-    // Backend Video.category enum (video.model.js); anything else fails the
-    // DB save AFTER the Cloudinary upload, so map unknown values to "Other".
-    const BACKEND_CATEGORIES = [
-      "Education", "Gaming", "Music", "Comedy", "News",
-      "Technology", "Sports", "Entertainment", "Other",
-    ];
-    const backendCategory = BACKEND_CATEGORIES.includes(category) ? category : "Other";
-
-    const handle = uploadFile(file, {
-      onProgress: (p) => {
-        setProgress(p);
-        // All bytes sent — now waiting for the server to store the file and
-        // create the record. Show that honestly instead of a finished state.
-        if (p.percent >= 100) setUploadState("processing");
-      },
-      extraFields: {
-        title: title.trim(),
-        description: description.trim(),
-        category: backendCategory,
-        tags,
-        visibility,
-        isShort: String(isShort),
-        forKids: String(forKids),
-        duration: String(duration || 0),
-        ...(playlistId ? { playlistId: String(playlistId) } : {}),
-      },
-      extraFiles: { thumbnail: thumbFileRef.current },
-    });
-    handleRef.current = handle;
-
-    try {
-      const created = await handle.promise;
-      if (!created.id) {
-        throw new Error(
-          "The server did not confirm that the video was saved. Please try again."
-        );
-      }
-      setVideoUrl(created.url);
-      setPublishedId(created.id);
-      setUploadState("ready");
-      setStage("success");
-      triggerFeedRefresh();
-      refreshUser();
-      showToast("Video published", "success");
-    } catch (err) {
-      if (err instanceof UploadCancelledError) {
-        setUploadState("cancelled");
-        setErrorMessage("Upload cancelled.");
-        return;
-      }
-      setUploadState("error");
-      setErrorMessage(
-        (err as Error).message ||
-          "Upload failed. Please check your internet connection and try again."
-      );
-    } finally {
-      handleRef.current = null;
-      publishingRef.current = false;
-    }
-  };
-
   const retryUpload = () => {
     if (!file) return;
-    if (USE_EXTERNAL_BACKEND) {
-      publishExternal();
-      return;
-    }
     setProgress(null);
     // Reuse the same uploadId so the server resumes instead of restarting.
     beginUpload(file, handleRef.current?.uploadId);
@@ -495,10 +356,6 @@ export function UploadStudio({ onClose }: { onClose: () => void }) {
     e.preventDefault();
     // Double-tap / double-submit protection.
     if (publishingRef.current) return;
-    if (USE_EXTERNAL_BACKEND) {
-      await publishExternal();
-      return;
-    }
     if (uploadState !== "ready" || !videoUrl) {
       setErrorMessage("Please wait for the upload to finish before publishing.");
       return;
@@ -998,11 +855,7 @@ export function UploadStudio({ onClose }: { onClose: () => void }) {
                 </button>
                 <button
                   type="submit"
-                  disabled={
-                    USE_EXTERNAL_BACKEND
-                      ? !file || busy || uploadState === "publishing"
-                      : uploadState !== "ready"
-                  }
+                  disabled={uploadState !== "ready"}
                   className="inline-flex items-center gap-2 px-6 py-2.5 rounded-full bg-red-600 hover:bg-red-500 disabled:opacity-50 text-white text-xs font-semibold shadow"
                 >
                   {uploadState === "publishing" && (

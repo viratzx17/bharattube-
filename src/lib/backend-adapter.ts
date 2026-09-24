@@ -212,14 +212,9 @@ export function adaptVideo(raw: unknown): AdaptedVideo | null {
       ownerIsObject ? owner.name : "",
       ownerIsObject ? owner.username : "",
       v.channelName,
-      (v.channel as Record<string, unknown> | undefined)?.channelName,
       "BharatTube creator"
     ),
-    avatarUrl:
-      str(
-        ownerIsObject ? owner.profilePhoto : "",
-        (v.channel as Record<string, unknown> | undefined)?.logo
-      ) || null,
+    avatarUrl: str(ownerIsObject ? owner.profilePhoto : "") || null,
     isVerified: Boolean(ownerIsObject && owner.verified),
     subscriberCount: num(ownerIsObject ? owner.subscribersCount : 0),
   };

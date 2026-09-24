@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect, useRef, useCallback } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import {
@@ -16,81 +16,13 @@ import {
 } from "lucide-react";
 import { ProtectedRoute } from "@/components/ProtectedRoute";
 import { UserAvatar } from "@/components/VideoComponents";
-import { useApp, mapBackendChannel, type ChannelProfile } from "@/context/AppContext";
-import { apiUrl, channelMeApiUrl } from "@/lib/api-config";
-import { getSessionToken } from "@/lib/client";
+import { useApp } from "@/context/AppContext";
+import { apiUrl } from "@/lib/api-config";
 
-// Backend rule (channel.validator.js): letters, numbers, ".", "_", "-"; 3–30.
-// The backend lowercases handles, so lowercase is enforced here too.
-const HANDLE_RE = /^[a-z0-9._-]{3,30}$/;
-
-function bearer(): Record<string, string> {
-  const t = getSessionToken();
-  return t ? { Authorization: `Bearer ${t}` } : {};
-}
+const HANDLE_RE = /^[a-z0-9_]{3,30}$/;
 
 function EditChannelContent() {
-  const { user, channel: ctxChannel, refreshUser, triggerFeedRefresh, showToast } = useApp();
-
-  /*
-   * The page loads the signed-in user's channel itself from the backend's
-   * GET /channel/me (Bearer). Previously it only waited for `channel` from
-   * context, which the external-backend session never filled → the page
-   * showed "Loading your channel..." forever.
-   *   ready   → channel found, edit it (PUT /channel)
-   *   missing → backend 404 "Channel not found" → same form creates it (POST /channel)
-   *   error   → real backend/network error with Retry
-   */
-  const [channel, setChannel] = useState<ChannelProfile | null>(ctxChannel);
-  const [loadState, setLoadState] = useState<"loading" | "ready" | "missing" | "error">(
-    ctxChannel ? "ready" : "loading"
-  );
-  const [loadError, setLoadError] = useState("");
-
-  const loadMyChannel = useCallback(async () => {
-    setLoadState("loading");
-    setLoadError("");
-    try {
-      const res = await fetch(channelMeApiUrl(), {
-        cache: "no-store",
-        credentials: "include",
-        headers: bearer(),
-      });
-      const data = await res.json().catch(() => null);
-      if (res.ok) {
-        const mapped = mapBackendChannel(data);
-        if (mapped) {
-          setChannel(mapped);
-          setLoadState("ready");
-          return;
-        }
-      }
-      if (res.status === 404) {
-        setChannel(null);
-        setLoadState("missing");
-        return;
-      }
-      setLoadError(
-        res.status === 401
-          ? "Your session has expired. Please sign in again."
-          : (data && (data.message || data.error)) || `Could not load your channel (HTTP ${res.status}).`
-      );
-      setLoadState("error");
-    } catch {
-      setLoadError("Could not reach the server. Please check your connection and try again.");
-      setLoadState("error");
-    }
-  }, []);
-
-  useEffect(() => {
-    if (ctxChannel) {
-      setChannel(ctxChannel);
-      setLoadState("ready");
-    } else if (user) {
-      loadMyChannel();
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [ctxChannel, user?.id]);
+  const { user, channel, refreshUser, triggerFeedRefresh, showToast } = useApp();
   const router = useRouter();
 
   const [channelName, setChannelName] = useState("");
@@ -121,7 +53,7 @@ function EditChannelContent() {
     }
   }, [channel]);
 
-  if (!user || loadState === "loading") {
+  if (!user || !channel) {
     return (
       <div className="max-w-3xl mx-auto px-6 py-16 text-sm text-zinc-500">
         Loading your channel...
@@ -129,54 +61,18 @@ function EditChannelContent() {
     );
   }
 
-  if (loadState === "error") {
-    return (
-      <div className="max-w-3xl mx-auto px-6 py-16 text-sm">
-        <div className="flex items-start gap-2 p-3 rounded-xl bg-red-500/10 border border-red-500/30 text-red-500 font-medium">
-          <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
-          <span>{loadError}</span>
-        </div>
-        <button
-          type="button"
-          onClick={loadMyChannel}
-          className="mt-4 px-4 py-2 rounded-full bg-red-600 hover:bg-red-500 text-white text-xs font-semibold"
-        >
-          Retry
-        </button>
-      </div>
-    );
-  }
-
-  const uploadAsset = async (
-    file: File,
-    kind: "photo" | "banner"
-  ): Promise<string | null> => {
-    // Latest backend: PUT /channel/images, multipart field "logo" | "banner"
-    // (the old /upload route does not exist). Needs an existing channel.
-    if (!channel) {
-      showToast("Save your channel first, then add images.", "error");
-      return null;
-    }
-    const field = kind === "photo" ? "logo" : "banner";
+  const uploadAsset = async (file: File): Promise<string | null> => {
     const formData = new FormData();
-    formData.append(field, file);
+    formData.append("file", file);
     try {
-      const res = await fetch(apiUrl("/channel/images"), {
-        method: "PUT",
-        body: formData,
-        credentials: "include",
-        headers: bearer(),
-      });
-      const data = await res.json().catch(() => null);
+      const res = await fetch(apiUrl("/upload"), { method: "POST", body: formData });
       if (!res.ok) {
-        showToast((data && (data.message || data.error)) || "Upload failed", "error");
+        const data = await res.json().catch(() => ({}));
+        showToast(data?.error || "Upload failed", "error");
         return null;
       }
-      const updated = mapBackendChannel(data);
-      if (updated) setChannel(updated);
-      return ((kind === "photo" ? updated?.profilePhotoUrl : updated?.bannerUrl) || null) as
-        | string
-        | null;
+      const data = await res.json();
+      return data.url as string;
     } catch {
       showToast("Unable to connect. Please try again.", "error");
       return null;
@@ -190,7 +86,7 @@ function EditChannelContent() {
     const file = e.target.files?.[0];
     if (!file) return;
     setUploading(kind);
-    const url = await uploadAsset(file, kind);
+    const url = await uploadAsset(file);
     setUploading(null);
     if (e.target) e.target.value = "";
     if (!url) return;
@@ -216,13 +112,9 @@ function EditChannelContent() {
       setError("Channel name cannot be empty.");
       return;
     }
-    if (channelName.trim().length < 3 || channelName.trim().length > 50) {
-      setError("Channel name must be between 3 and 50 characters.");
-      return;
-    }
     if (!HANDLE_RE.test(handle.trim())) {
       setError(
-        "Handle must be 3–30 characters and can only contain lowercase letters, numbers, dot (.), underscore (_) and hyphen (-)."
+        "Handle must be 3–30 characters and can only contain lowercase letters, numbers and underscores."
       );
       return;
     }
@@ -233,40 +125,23 @@ function EditChannelContent() {
 
     setSaving(true);
     try {
-      // Latest backend: PUT /channel (auth-protected; verified live — the old
-      // PATCH /channels route does not exist). `logo`/`banner` are the
-      // backend's own channel field names (as returned by GET /channel/:handle).
-      // No channel yet (GET /channel/me → 404) → create it: POST /channel.
-      const creating = !channel;
-      const res = await fetch(apiUrl("/channel"), {
-        method: creating ? "POST" : "PUT",
-        headers: { "Content-Type": "application/json", ...bearer() },
-        credentials: "include",
+      const res = await fetch(apiUrl("/channels"), {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           channelName: channelName.trim(),
-          handle: handle.trim().toLowerCase(),
+          handle: handle.trim(),
           description: description.trim(),
           contactEmail: contactEmail.trim(),
           profilePhotoUrl,
           bannerUrl,
-          // Only real hosted URLs (images are uploaded via PUT /channel/images).
-          ...(profilePhotoUrl && /^https?:\/\//.test(profilePhotoUrl) ? { logo: profilePhotoUrl } : {}),
-          ...(bannerUrl && /^https?:\/\//.test(bannerUrl) ? { banner: bannerUrl } : {}),
           links: links.filter((l) => l.label.trim() && l.url.trim()),
         }),
       });
-      const data = await res.json().catch(() => null);
+      const data = await res.json();
 
       if (!res.ok || !data?.success) {
-        const details = Array.isArray(data?.errors)
-          ? data.errors.map((x: any) => x?.msg).filter(Boolean).join(", ")
-          : "";
-        setError(
-          details ||
-            data?.message ||
-            data?.error ||
-            "Something went wrong. Please try again."
-        );
+        setError(data?.error || "Something went wrong. Please try again.");
         return;
       }
 
@@ -276,15 +151,7 @@ function EditChannelContent() {
       setSaved(true);
       showToast("Channel updated", "success");
       router.refresh();
-      const savedChannel = mapBackendChannel(data);
-      if (savedChannel) {
-        setChannel(savedChannel);
-        setLoadState("ready");
-      }
-      // Backend resolves channels by HANDLE only.
-      router.push(
-        `/channel/${encodeURIComponent(savedChannel?.handle || handle.trim().toLowerCase())}`
-      );
+      router.push(`/channel/${user.id}`);
     } catch {
       setError("Unable to connect. Please check your internet connection and try again.");
     } finally {
