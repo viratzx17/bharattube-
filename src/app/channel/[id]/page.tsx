@@ -26,7 +26,7 @@ import {
 } from "@/components/VideoComponents";
 import { formatCount, formatDuration } from "@/lib/format";
 import { useApp } from "@/context/AppContext";
-import { adaptChannel, adaptVideos } from "@/lib/backend-adapter";
+import { adaptChannel, adaptVideos, listOf } from "@/lib/backend-adapter";
 import { apiUrl, channelApiUrl, channelMeApiUrl, isRouteNotFound } from "@/lib/api-config";
 
 interface ChannelProfile {
@@ -53,6 +53,80 @@ interface PlaylistSummary {
   visibility: string;
   itemCount: number;
   thumbnailUrl: string | null;
+}
+
+/**
+ * Resolve a channel id / owner id / username / "@handle" to the channel
+ * HANDLE using only verified backend routes. Returns "" when unresolvable.
+ */
+async function resolveChannelHandle(
+  slug: string,
+  currentUserId: string | number | null | undefined
+): Promise<string> {
+  const clean = slug.replace(/^@/, "").trim();
+  if (!clean) return "";
+  const handleOf = (c: any): string =>
+    c && typeof c === "object" ? String(c.handle || "").trim() : "";
+
+  // 1. "@handle" → handle (backend rejects the "@" prefix).
+  if (clean !== slug) return clean;
+
+  // 2. Signed-in user's own channel by channel _id / owner id / username.
+  if (currentUserId != null) {
+    try {
+      const r = await fetch(channelMeApiUrl(), { cache: "no-store", credentials: "include" });
+      if (r.ok) {
+        const d = await r.json();
+        const ch = (d && (d.data?.channel || d.data || d.channel)) || null;
+        const owner = ch && typeof ch.owner === "object" ? ch.owner : {};
+        const keys = [ch?._id, ch?.id, owner?._id, owner?.id, owner?.username, ch?.owner]
+          .filter(Boolean)
+          .map(String);
+        if (keys.includes(clean) && handleOf(ch)) return handleOf(ch);
+      }
+    } catch {
+      /* fall through */
+    }
+  }
+
+  // 3. Owner user id → a video of theirs carries the populated channel.
+  if (/^[a-f0-9]{24}$/i.test(clean)) {
+    try {
+      const r = await fetch(apiUrl(`/videos?userId=${encodeURIComponent(clean)}`), {
+        cache: "no-store",
+      });
+      if (r.ok) {
+        const list = listOf(await r.json(), "videos") as any[];
+        for (const v of list) {
+          const ownerId = String(v?.owner?._id || v?.owner || v?.userId || "");
+          const h = handleOf(v?.channel) || v?.channelHandle || handleOf(v?.owner);
+          if (h && (!ownerId || ownerId === clean)) return String(h);
+        }
+      }
+    } catch {
+      /* fall through */
+    }
+    return "";
+  }
+
+  // 4. Account username / channel name → exact handle match via search.
+  try {
+    const r = await fetch(apiUrl(`/search?q=${encodeURIComponent(clean)}`), {
+      cache: "no-store",
+    });
+    if (r.ok) {
+      const d = await r.json();
+      const channels: any[] = Array.isArray(d?.channels) ? d.channels : [];
+      const lower = clean.toLowerCase();
+      const hit =
+        channels.find((c) => handleOf(c).toLowerCase() === lower) ||
+        channels.find((c) => String(c?._id || "") === clean);
+      if (hit) return handleOf(hit);
+    }
+  } catch {
+    /* unresolvable */
+  }
+  return "";
 }
 
 export default function ChannelPage({
@@ -116,6 +190,22 @@ export default function ChannelPage({
                   ""
               )
             : "";
+
+        // Latest backend: GET /channel/:handle ONLY (verified: a Channel _id,
+        // owner user id or "@handle" all return "Channel not found"). Links
+        // that still carry an id / username are resolved to the real handle
+        // through existing routes, then replaced with the canonical URL.
+        const slugIsOwnUserId =
+          user != null && String(id) !== "" && String(id) === String(user.id);
+        if (!slugIsOwnUserId && !/route '.*' not found/i.test(msg)) {
+          const resolved = await resolveChannelHandle(String(id), user?.id);
+          if (resolved && resolved !== String(id)) {
+            router.replace(
+              `/channel/${encodeURIComponent(resolved)}${window.location.search}`
+            );
+            return;
+          }
+        }
 
         // ROOT-CAUSE FIX: the backend resolves channels only by HANDLE, while
         // "Your Channel" links carry the signed-in user's id. When a resource
@@ -218,10 +308,11 @@ export default function ChannelPage({
         createdAt: adapted.createdAt,
       });
 
-      // Channel videos — real endpoint, keyed by the channel OWNER id.
-      if (adapted.ownerUserId) {
+      // Channel videos — backend GET /channel/:handle/videos (public videos of
+      // THIS channel). GET /videos ignores userId and returns every channel's.
+      if (adapted.username) {
         const vres = await fetch(
-          apiUrl(`/videos?userId=${encodeURIComponent(adapted.ownerUserId)}`),
+          apiUrl(`/channel/${encodeURIComponent(adapted.username)}/videos`),
           { cache: "no-store" }
         );
         if (vres.ok) {

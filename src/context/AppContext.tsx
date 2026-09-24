@@ -23,6 +23,7 @@ import {
   normalizeMeResponse,
   describeOAuthError,
   apiUrl,
+  channelMeApiUrl,
 } from "@/lib/api-config";
 
 /* ------------------------------------------------------------------ */
@@ -59,6 +60,37 @@ export interface ChannelProfile {
   videoCount: number;
   createdAt: string;
   updatedAt: string;
+}
+
+/**
+ * Map the backend channel document ({ success, data: { _id, owner, channelName,
+ * handle, logo, banner, description, subscribers[], subscribersCount,
+ * totalVideos, links?, contactEmail? } }) to ChannelProfile.
+ */
+export function mapBackendChannel(payload: unknown): ChannelProfile | null {
+  if (!payload || typeof payload !== "object") return null;
+  const root = payload as Record<string, any>;
+  const c = (root.data && typeof root.data === "object"
+    ? root.data.channel || root.data
+    : root.channel || root) as Record<string, any>;
+  if (!c || (!c._id && !c.handle)) return null;
+  const owner = c.owner && typeof c.owner === "object" ? c.owner : { _id: c.owner };
+  const num = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : 0);
+  return {
+    channelId: (c._id ?? c.id) as any,
+    ownerUserId: (owner?._id ?? owner?.id ?? "") as any,
+    channelName: String(c.channelName || c.name || ""),
+    handle: String(c.handle || ""),
+    profilePhotoUrl: c.logo || c.profilePhotoUrl || c.avatar || null,
+    bannerUrl: c.banner || c.bannerUrl || null,
+    description: String(c.description || ""),
+    links: Array.isArray(c.links) ? c.links : [],
+    contactEmail: c.contactEmail || null,
+    subscriberCount: num(c.subscribersCount) || (Array.isArray(c.subscribers) ? c.subscribers.length : 0),
+    videoCount: num(c.totalVideos),
+    createdAt: String(c.createdAt || ""),
+    updatedAt: String(c.updatedAt || ""),
+  };
 }
 
 export interface Preferences {
@@ -235,7 +267,15 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     clearSessionToken();
   }, []);
 
-  const refreshUser = useCallback(
+  /*
+   * The backend rate-limits EVERY /auth/* route (incl. /auth/me) to
+   * 20 requests / 15 min per IP. Concurrent refreshes (boot, OAuth callback,
+   * 401 events, uploads) share ONE in-flight request instead of each spending
+   * a slot and eventually getting 429.
+   */
+  const refreshInFlightRef = useRef<Promise<void> | null>(null);
+
+  const refreshUserOnce = useCallback(
     async (opts?: { announceExpiry?: boolean }) => {
       try {
         // Always re-seed the interceptor before reading the session so a token
@@ -284,9 +324,20 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             }
           }
 
+          // The backend authenticates with `Authorization: Bearer <JWT>`
+          // ("No Token Provided" otherwise). Without a token /auth/me can only
+          // 401, so don't spend a rate-limited /auth request on it.
+          const bearer = getSessionToken();
+          if (!bearer) {
+            if (hadSessionRef.current) clearSession();
+            setAuthStatus("unauthenticated");
+            return;
+          }
+
           const extRes = await fetch(authEndpoints.me, {
             cache: "no-store",
             credentials: "include",
+            headers: { Authorization: `Bearer ${bearer}` },
           });
           if (extRes.status === 401) {
             const wasSignedIn = hadSessionRef.current;
@@ -298,7 +349,24 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             }
             return;
           }
-          if (!extRes.ok) return; // transient error: keep current state
+          if (!extRes.ok) {
+            // 429 (auth rate limit) / 5xx: NOT a logout. Keep any restored
+            // session; never leave the app stuck on "loading".
+            if (extRes.status === 429 && !hadSessionRef.current) {
+              showToast(
+                "Too many sign-in requests. Please wait a few minutes and try again.",
+                "error"
+              );
+            }
+            setAuthStatus((prev) =>
+              prev === "loading"
+                ? hadSessionRef.current
+                  ? "authenticated"
+                  : "unauthenticated"
+                : prev
+            );
+            return;
+          }
 
           const payload = await extRes.json();
           const normalized = normalizeMeResponse(payload);
@@ -310,14 +378,30 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           }
           if (normalized.token) saveSessionToken(normalized.token);
 
+          // The signed-in user's channel: verified GET /channel/me (Bearer).
+          // Edit Channel reads `channel` from context, so it must be real data.
+          let myChannel: ChannelProfile | null = null;
+          try {
+            const chRes = await fetch(channelMeApiUrl(), {
+              cache: "no-store",
+              credentials: "include",
+              headers: { Authorization: `Bearer ${normalized.token || bearer}` },
+            });
+            if (chRes.ok) {
+              myChannel = mapBackendChannel(await chRes.json().catch(() => null));
+            }
+          } catch {
+            /* channel is optional; user stays signed in */
+          }
+
           hadSessionRef.current = true;
           setUser(normalized.user);
-          setChannel(null);
+          setChannel(myChannel);
           setPreferences(null);
           setAuthStatus("authenticated");
           saveSessionSnapshot({
             user: normalized.user,
-            channel: null,
+            channel: myChannel,
             preferences: null,
             token: normalized.token || getSessionToken(),
           });
@@ -385,6 +469,18 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     [clearSession, showToast]
   );
 
+  const refreshUser = useCallback(
+    (opts?: { announceExpiry?: boolean }) => {
+      if (refreshInFlightRef.current) return refreshInFlightRef.current;
+      const p = refreshUserOnce(opts).finally(() => {
+        refreshInFlightRef.current = null;
+      });
+      refreshInFlightRef.current = p;
+      return p;
+    },
+    [refreshUserOnce]
+  );
+
   /* Any 401 from the API means the session is no longer valid. */
   useEffect(() => {
     const onUnauthorized = () => refreshUser({ announceExpiry: true });
@@ -437,6 +533,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   // One gentle retry only if we still have no session after boot.
   useEffect(() => {
     if (authStatus !== "unauthenticated") return;
+    if (USE_EXTERNAL_BACKEND && !getSessionToken()) return;
     const t = setTimeout(() => refreshUser(), 800);
     return () => clearTimeout(t);
   }, [authStatus, refreshUser]);

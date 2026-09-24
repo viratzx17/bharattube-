@@ -140,12 +140,10 @@ export function apiUrl(path: string): string {
  */
 export const videoUploadCandidates: string[] = USE_EXTERNAL_BACKEND
   ? [
-      `${EXTERNAL_API_BASE}/videos/upload`,
+      // VERIFIED live: POST /videos is the backend's only (auth-protected)
+      // video create route. /videos/upload, /video, /upload… all return
+      // "Route '…' not found", so they are no longer tried.
       `${EXTERNAL_API_BASE}/videos`,
-      `${EXTERNAL_API_BASE}/video/upload`,
-      `${EXTERNAL_API_BASE}/video`,
-      `${EXTERNAL_API_BASE}/upload/video`,
-      `${EXTERNAL_API_BASE}/upload`,
     ]
   : ["/api/upload"];
 
@@ -304,9 +302,12 @@ export function normalizeMeResponse(payload: unknown): NormalizedMe | null {
           : (root.data as Record<string, unknown>))
       : root) as Record<string, unknown>;
 
+  // MongoDB ObjectIds must stay strings (an all-digit id would otherwise be
+  // coerced to a lossy Number and never match owner ids from the API).
   const id =
-    pickNumber(candidate.id, candidate._id, candidate.userId, root.id) ??
-    (typeof candidate._id === "string" ? candidate._id : 0);
+    pickString(candidate._id, candidate.id, candidate.userId, root.id) ||
+    pickNumber(candidate.id, candidate._id, candidate.userId, root.id) ||
+    0;
 
   const email = pickString(candidate.email, candidate.emailAddress)?.toLowerCase();
   if (!email) return null;
@@ -334,6 +335,7 @@ export function normalizeMeResponse(payload: unknown): NormalizedMe | null {
   const avatarUrl =
     pickString(
       candidate.avatarUrl,
+      candidate.profilePhoto, // latest backend field name
       candidate.avatar,
       candidate.profilePicture,
       candidate.picture,
@@ -401,6 +403,7 @@ export function describeOAuthError(searchParams: URLSearchParams): string {
     error === "access_denied" ||
     error === "cancelled" ||
     error === "cancel" ||
+    error.includes("cancel") || // backend: "google_login_cancelled"
     searchParams.get("cancelled") !== null ||
     searchParams.get("cancelledByUser") !== null
   ) {

@@ -1,0 +1,29 @@
+{
+  "name": "next",
+  "version": "16.2.6-compat",
+  "private": true,
+  "type": "module",
+  "main": "./index.js",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    },
+    "./link": {
+      "types": "./link.d.ts",
+      "default": "./link.js"
+    },
+    "./navigation": {
+      "types": "./navigation.d.ts",
+      "default": "./navigation.js"
+    },
+    "./server": {
+      "types": "./server.d.ts",
+      "default": "./server.js"
+    }
+  },
+  "peerDependencies": {
+    "react": "*"
+  }
+}

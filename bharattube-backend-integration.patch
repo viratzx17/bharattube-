@@ -1,0 +1,1238 @@
+diff --git a/src/app/auth/callback/page.tsx b/src/app/auth/callback/page.tsx
+index 615403c..f2648e3 100644
+--- a/src/app/auth/callback/page.tsx
++++ b/src/app/auth/callback/page.tsx
+@@ -4,6 +4,8 @@ import React, { Suspense, useEffect, useState } from "react";
+ import { useRouter, useSearchParams } from "next/navigation";
+ import Link from "next/link";
+ import { Loader2, AlertCircle } from "lucide-react";
++import { saveSessionToken, getSessionToken } from "@/lib/client";
++import { useApp } from "@/context/AppContext";
+ 
+ /**
+  * BharatTube OAuth callback.
+@@ -30,10 +32,33 @@ function CallbackContent() {
+   const router = useRouter();
+   const searchParams = useSearchParams();
+   const [failed, setFailed] = useState(false);
++  const { refreshUser } = useApp();
+ 
+   useEffect(() => {
+     let cancelled = false;
+-    const token = searchParams.get("token");
++    const liveParams =
++      typeof window !== "undefined" ? new URLSearchParams(window.location.search) : null;
++    // Backend failure redirect (verified live):
++    //   /auth/google/callback?error=google_login_cancelled
++    // Never fall back to a stored token here — surface the real error on /login
++    // (AppContext turns ?error= into the existing toast).
++    const oauthError = searchParams.get("error") || liveParams?.get("error");
++    if (oauthError) {
++      router.replace(`/login?error=${encodeURIComponent(oauthError)}`);
++      return () => {
++        cancelled = true;
++      };
++    }
++
++    // The backend redirects to /auth/google/callback?token=<JWT>. AppContext
++    // may already have consumed (and stripped) it from the URL on boot, in
++    // which case it is already saved — use that instead of bouncing to login.
++    const token =
++      searchParams.get("token") ||
++      (typeof window !== "undefined"
++        ? new URLSearchParams(window.location.search).get("token")
++        : null) ||
++      getSessionToken();
+ 
+     if (!token) {
+       // No token -> login
+@@ -47,11 +72,15 @@ function CallbackContent() {
+     // not call setState synchronously (avoids a cascading render).
+     void Promise.resolve()
+       .then(() => {
++        // Write to EVERY token store (memory, sessionStorage, localStorage
++        // "bharattube_token", cookie). Writing only localStorage let a stale
++        // in-memory/sessionStorage token win, so /auth/me got the OLD token → 401.
++        saveSessionToken(token);
+         localStorage.setItem(TOKEN_KEY, token);
+       })
++      .then(() => refreshUser()) // GET /auth/me with the NEW token
+       .then(() => {
+         if (cancelled) return;
+-        // Go home; app boot then calls GET /api/v1/auth/me with the saved token.
+         router.replace("/");
+       })
+       .catch((err) => {
+@@ -62,6 +91,7 @@ function CallbackContent() {
+     return () => {
+       cancelled = true;
+     };
++  // eslint-disable-next-line react-hooks/exhaustive-deps
+   }, [router, searchParams]);
+ 
+   if (failed) {
+diff --git a/src/app/channel/[id]/page.tsx b/src/app/channel/[id]/page.tsx
+index 257f31b..a97b5d8 100644
+--- a/src/app/channel/[id]/page.tsx
++++ b/src/app/channel/[id]/page.tsx
+@@ -26,7 +26,7 @@ import {
+ } from "@/components/VideoComponents";
+ import { formatCount, formatDuration } from "@/lib/format";
+ import { useApp } from "@/context/AppContext";
+-import { adaptChannel, adaptVideos } from "@/lib/backend-adapter";
++import { adaptChannel, adaptVideos, listOf } from "@/lib/backend-adapter";
+ import { apiUrl, channelApiUrl, channelMeApiUrl, isRouteNotFound } from "@/lib/api-config";
+ 
+ interface ChannelProfile {
+@@ -55,6 +55,80 @@ interface PlaylistSummary {
+   thumbnailUrl: string | null;
+ }
+ 
++/**
++ * Resolve a channel id / owner id / username / "@handle" to the channel
++ * HANDLE using only verified backend routes. Returns "" when unresolvable.
++ */
++async function resolveChannelHandle(
++  slug: string,
++  currentUserId: string | number | null | undefined
++): Promise<string> {
++  const clean = slug.replace(/^@/, "").trim();
++  if (!clean) return "";
++  const handleOf = (c: any): string =>
++    c && typeof c === "object" ? String(c.handle || "").trim() : "";
++
++  // 1. "@handle" → handle (backend rejects the "@" prefix).
++  if (clean !== slug) return clean;
++
++  // 2. Signed-in user's own channel by channel _id / owner id / username.
++  if (currentUserId != null) {
++    try {
++      const r = await fetch(channelMeApiUrl(), { cache: "no-store", credentials: "include" });
++      if (r.ok) {
++        const d = await r.json();
++        const ch = (d && (d.data?.channel || d.data || d.channel)) || null;
++        const owner = ch && typeof ch.owner === "object" ? ch.owner : {};
++        const keys = [ch?._id, ch?.id, owner?._id, owner?.id, owner?.username, ch?.owner]
++          .filter(Boolean)
++          .map(String);
++        if (keys.includes(clean) && handleOf(ch)) return handleOf(ch);
++      }
++    } catch {
++      /* fall through */
++    }
++  }
++
++  // 3. Owner user id → a video of theirs carries the populated channel.
++  if (/^[a-f0-9]{24}$/i.test(clean)) {
++    try {
++      const r = await fetch(apiUrl(`/videos?userId=${encodeURIComponent(clean)}`), {
++        cache: "no-store",
++      });
++      if (r.ok) {
++        const list = listOf(await r.json(), "videos") as any[];
++        for (const v of list) {
++          const ownerId = String(v?.owner?._id || v?.owner || v?.userId || "");
++          const h = handleOf(v?.channel) || v?.channelHandle || handleOf(v?.owner);
++          if (h && (!ownerId || ownerId === clean)) return String(h);
++        }
++      }
++    } catch {
++      /* fall through */
++    }
++    return "";
++  }
++
++  // 4. Account username / channel name → exact handle match via search.
++  try {
++    const r = await fetch(apiUrl(`/search?q=${encodeURIComponent(clean)}`), {
++      cache: "no-store",
++    });
++    if (r.ok) {
++      const d = await r.json();
++      const channels: any[] = Array.isArray(d?.channels) ? d.channels : [];
++      const lower = clean.toLowerCase();
++      const hit =
++        channels.find((c) => handleOf(c).toLowerCase() === lower) ||
++        channels.find((c) => String(c?._id || "") === clean);
++      if (hit) return handleOf(hit);
++    }
++  } catch {
++    /* unresolvable */
++  }
++  return "";
++}
++
+ export default function ChannelPage({
+   params,
+ }: {
+@@ -117,6 +191,22 @@ export default function ChannelPage({
+               )
+             : "";
+ 
++        // Latest backend: GET /channel/:handle ONLY (verified: a Channel _id,
++        // owner user id or "@handle" all return "Channel not found"). Links
++        // that still carry an id / username are resolved to the real handle
++        // through existing routes, then replaced with the canonical URL.
++        const slugIsOwnUserId =
++          user != null && String(id) !== "" && String(id) === String(user.id);
++        if (!slugIsOwnUserId && !/route '.*' not found/i.test(msg)) {
++          const resolved = await resolveChannelHandle(String(id), user?.id);
++          if (resolved && resolved !== String(id)) {
++            router.replace(
++              `/channel/${encodeURIComponent(resolved)}${window.location.search}`
++            );
++            return;
++          }
++        }
++
+         // ROOT-CAUSE FIX: the backend resolves channels only by HANDLE, while
+         // "Your Channel" links carry the signed-in user's id. When a resource
+         // miss hits exactly the current user's id, resolve the REAL handle
+@@ -218,10 +308,11 @@ export default function ChannelPage({
+         createdAt: adapted.createdAt,
+       });
+ 
+-      // Channel videos — real endpoint, keyed by the channel OWNER id.
+-      if (adapted.ownerUserId) {
++      // Channel videos — backend GET /channel/:handle/videos (public videos of
++      // THIS channel). GET /videos ignores userId and returns every channel's.
++      if (adapted.username) {
+         const vres = await fetch(
+-          apiUrl(`/videos?userId=${encodeURIComponent(adapted.ownerUserId)}`),
++          apiUrl(`/channel/${encodeURIComponent(adapted.username)}/videos`),
+           { cache: "no-store" }
+         );
+         if (vres.ok) {
+diff --git a/src/app/edit-channel/page.tsx b/src/app/edit-channel/page.tsx
+index 536a531..5148931 100644
+--- a/src/app/edit-channel/page.tsx
++++ b/src/app/edit-channel/page.tsx
+@@ -1,6 +1,6 @@
+ "use client";
+ 
+-import React, { useState, useEffect, useRef } from "react";
++import React, { useState, useEffect, useRef, useCallback } from "react";
+ import { useRouter } from "next/navigation";
+ import Link from "next/link";
+ import {
+@@ -16,13 +16,81 @@ import {
+ } from "lucide-react";
+ import { ProtectedRoute } from "@/components/ProtectedRoute";
+ import { UserAvatar } from "@/components/VideoComponents";
+-import { useApp } from "@/context/AppContext";
+-import { apiUrl } from "@/lib/api-config";
++import { useApp, mapBackendChannel, type ChannelProfile } from "@/context/AppContext";
++import { apiUrl, channelMeApiUrl } from "@/lib/api-config";
++import { getSessionToken } from "@/lib/client";
+ 
+-const HANDLE_RE = /^[a-z0-9_]{3,30}$/;
++// Backend rule (channel.validator.js): letters, numbers, ".", "_", "-"; 3–30.
++// The backend lowercases handles, so lowercase is enforced here too.
++const HANDLE_RE = /^[a-z0-9._-]{3,30}$/;
++
++function bearer(): Record<string, string> {
++  const t = getSessionToken();
++  return t ? { Authorization: `Bearer ${t}` } : {};
++}
+ 
+ function EditChannelContent() {
+-  const { user, channel, refreshUser, triggerFeedRefresh, showToast } = useApp();
++  const { user, channel: ctxChannel, refreshUser, triggerFeedRefresh, showToast } = useApp();
++
++  /*
++   * The page loads the signed-in user's channel itself from the backend's
++   * GET /channel/me (Bearer). Previously it only waited for `channel` from
++   * context, which the external-backend session never filled → the page
++   * showed "Loading your channel..." forever.
++   *   ready   → channel found, edit it (PUT /channel)
++   *   missing → backend 404 "Channel not found" → same form creates it (POST /channel)
++   *   error   → real backend/network error with Retry
++   */
++  const [channel, setChannel] = useState<ChannelProfile | null>(ctxChannel);
++  const [loadState, setLoadState] = useState<"loading" | "ready" | "missing" | "error">(
++    ctxChannel ? "ready" : "loading"
++  );
++  const [loadError, setLoadError] = useState("");
++
++  const loadMyChannel = useCallback(async () => {
++    setLoadState("loading");
++    setLoadError("");
++    try {
++      const res = await fetch(channelMeApiUrl(), {
++        cache: "no-store",
++        credentials: "include",
++        headers: bearer(),
++      });
++      const data = await res.json().catch(() => null);
++      if (res.ok) {
++        const mapped = mapBackendChannel(data);
++        if (mapped) {
++          setChannel(mapped);
++          setLoadState("ready");
++          return;
++        }
++      }
++      if (res.status === 404) {
++        setChannel(null);
++        setLoadState("missing");
++        return;
++      }
++      setLoadError(
++        res.status === 401
++          ? "Your session has expired. Please sign in again."
++          : (data && (data.message || data.error)) || `Could not load your channel (HTTP ${res.status}).`
++      );
++      setLoadState("error");
++    } catch {
++      setLoadError("Could not reach the server. Please check your connection and try again.");
++      setLoadState("error");
++    }
++  }, []);
++
++  useEffect(() => {
++    if (ctxChannel) {
++      setChannel(ctxChannel);
++      setLoadState("ready");
++    } else if (user) {
++      loadMyChannel();
++    }
++    // eslint-disable-next-line react-hooks/exhaustive-deps
++  }, [ctxChannel, user?.id]);
+   const router = useRouter();
+ 
+   const [channelName, setChannelName] = useState("");
+@@ -53,7 +121,7 @@ function EditChannelContent() {
+     }
+   }, [channel]);
+ 
+-  if (!user || !channel) {
++  if (!user || loadState === "loading") {
+     return (
+       <div className="max-w-3xl mx-auto px-6 py-16 text-sm text-zinc-500">
+         Loading your channel...
+@@ -61,18 +129,54 @@ function EditChannelContent() {
+     );
+   }
+ 
+-  const uploadAsset = async (file: File): Promise<string | null> => {
++  if (loadState === "error") {
++    return (
++      <div className="max-w-3xl mx-auto px-6 py-16 text-sm">
++        <div className="flex items-start gap-2 p-3 rounded-xl bg-red-500/10 border border-red-500/30 text-red-500 font-medium">
++          <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
++          <span>{loadError}</span>
++        </div>
++        <button
++          type="button"
++          onClick={loadMyChannel}
++          className="mt-4 px-4 py-2 rounded-full bg-red-600 hover:bg-red-500 text-white text-xs font-semibold"
++        >
++          Retry
++        </button>
++      </div>
++    );
++  }
++
++  const uploadAsset = async (
++    file: File,
++    kind: "photo" | "banner"
++  ): Promise<string | null> => {
++    // Latest backend: PUT /channel/images, multipart field "logo" | "banner"
++    // (the old /upload route does not exist). Needs an existing channel.
++    if (!channel) {
++      showToast("Save your channel first, then add images.", "error");
++      return null;
++    }
++    const field = kind === "photo" ? "logo" : "banner";
+     const formData = new FormData();
+-    formData.append("file", file);
++    formData.append(field, file);
+     try {
+-      const res = await fetch(apiUrl("/upload"), { method: "POST", body: formData });
++      const res = await fetch(apiUrl("/channel/images"), {
++        method: "PUT",
++        body: formData,
++        credentials: "include",
++        headers: bearer(),
++      });
++      const data = await res.json().catch(() => null);
+       if (!res.ok) {
+-        const data = await res.json().catch(() => ({}));
+-        showToast(data?.error || "Upload failed", "error");
++        showToast((data && (data.message || data.error)) || "Upload failed", "error");
+         return null;
+       }
+-      const data = await res.json();
+-      return data.url as string;
++      const updated = mapBackendChannel(data);
++      if (updated) setChannel(updated);
++      return ((kind === "photo" ? updated?.profilePhotoUrl : updated?.bannerUrl) || null) as
++        | string
++        | null;
+     } catch {
+       showToast("Unable to connect. Please try again.", "error");
+       return null;
+@@ -86,7 +190,7 @@ function EditChannelContent() {
+     const file = e.target.files?.[0];
+     if (!file) return;
+     setUploading(kind);
+-    const url = await uploadAsset(file);
++    const url = await uploadAsset(file, kind);
+     setUploading(null);
+     if (e.target) e.target.value = "";
+     if (!url) return;
+@@ -112,9 +216,13 @@ function EditChannelContent() {
+       setError("Channel name cannot be empty.");
+       return;
+     }
++    if (channelName.trim().length < 3 || channelName.trim().length > 50) {
++      setError("Channel name must be between 3 and 50 characters.");
++      return;
++    }
+     if (!HANDLE_RE.test(handle.trim())) {
+       setError(
+-        "Handle must be 3–30 characters and can only contain lowercase letters, numbers and underscores."
++        "Handle must be 3–30 characters and can only contain lowercase letters, numbers, dot (.), underscore (_) and hyphen (-)."
+       );
+       return;
+     }
+@@ -125,23 +233,40 @@ function EditChannelContent() {
+ 
+     setSaving(true);
+     try {
+-      const res = await fetch(apiUrl("/channels"), {
+-        method: "PATCH",
+-        headers: { "Content-Type": "application/json" },
++      // Latest backend: PUT /channel (auth-protected; verified live — the old
++      // PATCH /channels route does not exist). `logo`/`banner` are the
++      // backend's own channel field names (as returned by GET /channel/:handle).
++      // No channel yet (GET /channel/me → 404) → create it: POST /channel.
++      const creating = !channel;
++      const res = await fetch(apiUrl("/channel"), {
++        method: creating ? "POST" : "PUT",
++        headers: { "Content-Type": "application/json", ...bearer() },
++        credentials: "include",
+         body: JSON.stringify({
+           channelName: channelName.trim(),
+-          handle: handle.trim(),
++          handle: handle.trim().toLowerCase(),
+           description: description.trim(),
+           contactEmail: contactEmail.trim(),
+           profilePhotoUrl,
+           bannerUrl,
++          // Only real hosted URLs (images are uploaded via PUT /channel/images).
++          ...(profilePhotoUrl && /^https?:\/\//.test(profilePhotoUrl) ? { logo: profilePhotoUrl } : {}),
++          ...(bannerUrl && /^https?:\/\//.test(bannerUrl) ? { banner: bannerUrl } : {}),
+           links: links.filter((l) => l.label.trim() && l.url.trim()),
+         }),
+       });
+-      const data = await res.json();
++      const data = await res.json().catch(() => null);
+ 
+       if (!res.ok || !data?.success) {
+-        setError(data?.error || "Something went wrong. Please try again.");
++        const details = Array.isArray(data?.errors)
++          ? data.errors.map((x: any) => x?.msg).filter(Boolean).join(", ")
++          : "";
++        setError(
++          details ||
++            data?.message ||
++            data?.error ||
++            "Something went wrong. Please try again."
++        );
+         return;
+       }
+ 
+@@ -151,7 +276,15 @@ function EditChannelContent() {
+       setSaved(true);
+       showToast("Channel updated", "success");
+       router.refresh();
+-      router.push(`/channel/${user.id}`);
++      const savedChannel = mapBackendChannel(data);
++      if (savedChannel) {
++        setChannel(savedChannel);
++        setLoadState("ready");
++      }
++      // Backend resolves channels by HANDLE only.
++      router.push(
++        `/channel/${encodeURIComponent(savedChannel?.handle || handle.trim().toLowerCase())}`
++      );
+     } catch {
+       setError("Unable to connect. Please check your internet connection and try again.");
+     } finally {
+diff --git a/src/app/my-videos/page.tsx b/src/app/my-videos/page.tsx
+index 41b6f04..0e46fb3 100644
+--- a/src/app/my-videos/page.tsx
++++ b/src/app/my-videos/page.tsx
+@@ -28,6 +28,7 @@ import {
+ import { formatCount, formatDuration, formatTimeAgo } from "@/lib/format";
+ import { apiUrl, unwrapList } from "@/lib/api-config";
+ import { adaptVideos } from "@/lib/backend-adapter";
++import { getSessionToken } from "@/lib/client";
+ 
+ type Tab = "videos" | "shorts";
+ 
+@@ -55,7 +56,7 @@ function VisibilityBadge({ visibility }: { visibility: string }) {
+ }
+ 
+ function MyVideosContent() {
+-  const { openUploadModal, openPlaylistModal, showToast, triggerFeedRefresh } =
++  const { user, openUploadModal, openPlaylistModal, showToast, triggerFeedRefresh } =
+     useApp();
+   const router = useRouter();
+   const searchParams = useSearchParams();
+@@ -81,16 +82,33 @@ function MyVideosContent() {
+     setLoading(true);
+     setError("");
+     try {
+-      const res = await fetch(apiUrl("/videos?feed=my_videos"), { cache: "no-store" });
+-      const data = await res.json();
+-      if (!res.ok) throw new Error(data?.error || "Failed to load");
++      // Backend (studio.routes.js): GET /studio/videos → the signed-in user's
++      // OWN videos incl. private/unlisted and shorts ({ success, videos }).
++      // GET /videos ignores userId and returns everyone's public videos.
++      if (user?.id == null) {
++        setVideos([]);
++        return;
++      }
++      const token = getSessionToken();
++      const res = await fetch(apiUrl("/studio/videos?limit=100"), {
++        cache: "no-store",
++        credentials: "include",
++        headers: token ? { Authorization: `Bearer ${token}` } : {},
++      });
++      const data = await res.json().catch(() => null);
++      if (res.status === 404) {
++        // "Channel not found" → no channel yet, therefore no videos.
++        setVideos([]);
++        return;
++      }
++      if (!res.ok) throw new Error(data?.message || data?.error || "Failed to load");
+       setVideos(adaptVideos(data) as unknown as VideoItem[]);
+     } catch {
+       setError("Could not load your videos.");
+     } finally {
+       setLoading(false);
+     }
+-  }, []);
++  }, [user?.id]);
+ 
+   useEffect(() => {
+     load();
+diff --git a/src/app/watch/[id]/page.tsx b/src/app/watch/[id]/page.tsx
+index 461aa61..9f6bdbb 100644
+--- a/src/app/watch/[id]/page.tsx
++++ b/src/app/watch/[id]/page.tsx
+@@ -160,7 +160,8 @@ export default function WatchPage({
+   const fetchComments = useCallback(async () => {
+     try {
+       const res = await fetch(
+-        apiUrl(`/comments?videoId=${videoId}&sort=${commentSort}`),
++        // Latest backend: GET /comments/:videoId (verified live).
++        apiUrl(`/comments/${encodeURIComponent(videoId)}?sort=${commentSort}`),
+         { cache: "no-store" }
+       );
+ 
+@@ -269,7 +270,8 @@ export default function WatchPage({
+ 
+     setPostingComment(true);
+     try {
+-      const res = await fetch(apiUrl("/comments"), {
++      // Latest backend: POST /comments/:videoId (auth-protected, verified live).
++      const res = await fetch(apiUrl(`/comments/${encodeURIComponent(videoId)}`), {
+         method: "POST",
+         headers: { "Content-Type": "application/json" },
+         body: JSON.stringify({
+@@ -277,6 +279,9 @@ export default function WatchPage({
+           videoId,
+           content,
+           parentId,
++          // Backend comment.controller addComment reads { text, parentComment }.
++          text: content,
++          ...(parentId ? { parentComment: parentId } : {}),
+         }),
+       });
+       if (res.ok) {
+@@ -288,6 +293,9 @@ export default function WatchPage({
+         }
+         await fetchComments();
+         showToast(parentId ? "Reply added" : "Comment posted", "success");
++      } else {
++        const err = await res.json().catch(() => null);
++        showToast((err && (err.message || err.error)) || "Could not post the comment.", "error");
+       }
+     } finally {
+       setPostingComment(false);
+diff --git a/src/components/UploadStudio.tsx b/src/components/UploadStudio.tsx
+index 7c3457d..8d23bf3 100644
+--- a/src/components/UploadStudio.tsx
++++ b/src/components/UploadStudio.tsx
+@@ -90,7 +90,10 @@ export function UploadStudio({ onClose }: { onClose: () => void }) {
+   const [playlistId, setPlaylistId] = useState("");
+   const [playlists, setPlaylists] = useState<Array<{ id: number; title: string }>>([]);
+ 
+-  const [publishedId, setPublishedId] = useState<number | null>(null);
++  const [publishedId, setPublishedId] = useState<string | number | null>(null);
++  // External backend: the thumbnail travels as a file in the SAME create
++  // request as the video (the backend has no standalone upload route).
++  const thumbFileRef = useRef<File | null>(null);
+ 
+   const videoInputRef = useRef<HTMLInputElement>(null);
+   const thumbInputRef = useRef<HTMLInputElement>(null);
+@@ -279,13 +282,24 @@ export function UploadStudio({ onClose }: { onClose: () => void }) {
+       setTitle(base ? base.charAt(0).toUpperCase() + base.slice(1) : "");
+     }
+ 
+-    // Start uploading immediately while the user fills in details.
+-    beginUpload(f);
++    if (USE_EXTERNAL_BACKEND) {
++      // The backend's only create route (POST /videos) needs the video file
++      // AND its details in ONE request, so the upload runs on Publish.
++      setUploadState("idle");
++      setProgress(null);
++      setErrorMessage("");
++    } else {
++      // Start uploading immediately while the user fills in details.
++      beginUpload(f);
++    }
+ 
+     // Probe metadata + auto thumbnail (skip duration re-probe if already known).
+     const { duration: d, thumb } = await probeVideo(f, url);
+     if (d) setDuration(d);
+-    if (thumb && !thumbnailUrl) {
++    if (thumb && !thumbnailUrl && USE_EXTERNAL_BACKEND) {
++      thumbFileRef.current = thumb;
++      setThumbnailUrl(URL.createObjectURL(thumb));
++    } else if (thumb && !thumbnailUrl) {
+       try {
+         const asset = await uploadSmallFile(thumb);
+         setThumbnailUrl(asset.url);
+@@ -313,6 +327,12 @@ export function UploadStudio({ onClose }: { onClose: () => void }) {
+       showToast(`Thumbnail must be smaller than ${formatBytes(MAX_IMAGE_BYTES)}.`, "error");
+       return;
+     }
++    if (USE_EXTERNAL_BACKEND) {
++      thumbFileRef.current = f;
++      setThumbnailUrl(URL.createObjectURL(f));
++      showToast("Thumbnail updated", "success");
++      return;
++    }
+     setThumbBusy(true);
+     try {
+       const asset = await uploadSmallFile(f);
+@@ -345,8 +365,127 @@ export function UploadStudio({ onClose }: { onClose: () => void }) {
+     setErrorMessage("Upload cancelled.");
+   };
+ 
++  /**
++   * External backend publish: ONE multipart POST /videos carrying the video,
++   * thumbnail and details. Success is claimed only after the server responds
++   * with the created video record — reaching 100% bytes is not success.
++   */
++  const publishExternal = async () => {
++    if (!file || publishingRef.current) return;
++    if (!title.trim()) {
++      setErrorMessage("Please enter a title for your video.");
++      return;
++    }
++    // Backend rule (video.validator.js): title 5–120 chars. Checked BEFORE
++    // sending so the whole file is not uploaded just to be rejected.
++    if (title.trim().length < 5 || title.trim().length > 120) {
++      setErrorMessage("Title must be between 5 and 120 characters.");
++      return;
++    }
++    if (!thumbnailUrl && !isShort) {
++      setErrorMessage("Please choose a thumbnail for your video.");
++      return;
++    }
++
++    publishingRef.current = true;
++    setUploadState("uploading");
++    setProgress(null);
++    setErrorMessage("");
++
++    // Backend requires a channel ("Create your channel first") but only checks
++    // AFTER receiving the full file — verify first via GET /channel/me.
++    try {
++      const token = getSessionToken();
++      const chRes = await fetch(apiUrl("/channel/me"), {
++        cache: "no-store",
++        credentials: "include",
++        headers: token ? { Authorization: `Bearer ${token}` } : {},
++      });
++      if (chRes.status === 404) {
++        setUploadState("error");
++        setErrorMessage(
++          "Create your channel first (You → Edit channel), then upload your video."
++        );
++        publishingRef.current = false;
++        return;
++      }
++      if (chRes.status === 401) {
++        setUploadState("error");
++        setErrorMessage("Your session has expired. Please sign in again, then retry the upload.");
++        publishingRef.current = false;
++        return;
++      }
++    } catch {
++      /* network hiccup: let the upload request report the real error */
++    }
++
++    // Backend Video.category enum (video.model.js); anything else fails the
++    // DB save AFTER the Cloudinary upload, so map unknown values to "Other".
++    const BACKEND_CATEGORIES = [
++      "Education", "Gaming", "Music", "Comedy", "News",
++      "Technology", "Sports", "Entertainment", "Other",
++    ];
++    const backendCategory = BACKEND_CATEGORIES.includes(category) ? category : "Other";
++
++    const handle = uploadFile(file, {
++      onProgress: (p) => {
++        setProgress(p);
++        // All bytes sent — now waiting for the server to store the file and
++        // create the record. Show that honestly instead of a finished state.
++        if (p.percent >= 100) setUploadState("processing");
++      },
++      extraFields: {
++        title: title.trim(),
++        description: description.trim(),
++        category: backendCategory,
++        tags,
++        visibility,
++        isShort: String(isShort),
++        forKids: String(forKids),
++        duration: String(duration || 0),
++        ...(playlistId ? { playlistId: String(playlistId) } : {}),
++      },
++      extraFiles: { thumbnail: thumbFileRef.current },
++    });
++    handleRef.current = handle;
++
++    try {
++      const created = await handle.promise;
++      if (!created.id) {
++        throw new Error(
++          "The server did not confirm that the video was saved. Please try again."
++        );
++      }
++      setVideoUrl(created.url);
++      setPublishedId(created.id);
++      setUploadState("ready");
++      setStage("success");
++      triggerFeedRefresh();
++      refreshUser();
++      showToast("Video published", "success");
++    } catch (err) {
++      if (err instanceof UploadCancelledError) {
++        setUploadState("cancelled");
++        setErrorMessage("Upload cancelled.");
++        return;
++      }
++      setUploadState("error");
++      setErrorMessage(
++        (err as Error).message ||
++          "Upload failed. Please check your internet connection and try again."
++      );
++    } finally {
++      handleRef.current = null;
++      publishingRef.current = false;
++    }
++  };
++
+   const retryUpload = () => {
+     if (!file) return;
++    if (USE_EXTERNAL_BACKEND) {
++      publishExternal();
++      return;
++    }
+     setProgress(null);
+     // Reuse the same uploadId so the server resumes instead of restarting.
+     beginUpload(file, handleRef.current?.uploadId);
+@@ -356,6 +495,10 @@ export function UploadStudio({ onClose }: { onClose: () => void }) {
+     e.preventDefault();
+     // Double-tap / double-submit protection.
+     if (publishingRef.current) return;
++    if (USE_EXTERNAL_BACKEND) {
++      await publishExternal();
++      return;
++    }
+     if (uploadState !== "ready" || !videoUrl) {
+       setErrorMessage("Please wait for the upload to finish before publishing.");
+       return;
+@@ -855,7 +998,11 @@ export function UploadStudio({ onClose }: { onClose: () => void }) {
+                 </button>
+                 <button
+                   type="submit"
+-                  disabled={uploadState !== "ready"}
++                  disabled={
++                    USE_EXTERNAL_BACKEND
++                      ? !file || busy || uploadState === "publishing"
++                      : uploadState !== "ready"
++                  }
+                   className="inline-flex items-center gap-2 px-6 py-2.5 rounded-full bg-red-600 hover:bg-red-500 disabled:opacity-50 text-white text-xs font-semibold shadow"
+                 >
+                   {uploadState === "publishing" && (
+diff --git a/src/context/AppContext.tsx b/src/context/AppContext.tsx
+index 08f9c6c..378b64e 100644
+--- a/src/context/AppContext.tsx
++++ b/src/context/AppContext.tsx
+@@ -23,6 +23,7 @@ import {
+   normalizeMeResponse,
+   describeOAuthError,
+   apiUrl,
++  channelMeApiUrl,
+ } from "@/lib/api-config";
+ 
+ /* ------------------------------------------------------------------ */
+@@ -61,6 +62,37 @@ export interface ChannelProfile {
+   updatedAt: string;
+ }
+ 
++/**
++ * Map the backend channel document ({ success, data: { _id, owner, channelName,
++ * handle, logo, banner, description, subscribers[], subscribersCount,
++ * totalVideos, links?, contactEmail? } }) to ChannelProfile.
++ */
++export function mapBackendChannel(payload: unknown): ChannelProfile | null {
++  if (!payload || typeof payload !== "object") return null;
++  const root = payload as Record<string, any>;
++  const c = (root.data && typeof root.data === "object"
++    ? root.data.channel || root.data
++    : root.channel || root) as Record<string, any>;
++  if (!c || (!c._id && !c.handle)) return null;
++  const owner = c.owner && typeof c.owner === "object" ? c.owner : { _id: c.owner };
++  const num = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : 0);
++  return {
++    channelId: (c._id ?? c.id) as any,
++    ownerUserId: (owner?._id ?? owner?.id ?? "") as any,
++    channelName: String(c.channelName || c.name || ""),
++    handle: String(c.handle || ""),
++    profilePhotoUrl: c.logo || c.profilePhotoUrl || c.avatar || null,
++    bannerUrl: c.banner || c.bannerUrl || null,
++    description: String(c.description || ""),
++    links: Array.isArray(c.links) ? c.links : [],
++    contactEmail: c.contactEmail || null,
++    subscriberCount: num(c.subscribersCount) || (Array.isArray(c.subscribers) ? c.subscribers.length : 0),
++    videoCount: num(c.totalVideos),
++    createdAt: String(c.createdAt || ""),
++    updatedAt: String(c.updatedAt || ""),
++  };
++}
++
+ export interface Preferences {
+   theme: string;
+   language: string;
+@@ -235,7 +267,15 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
+     clearSessionToken();
+   }, []);
+ 
+-  const refreshUser = useCallback(
++  /*
++   * The backend rate-limits EVERY /auth/* route (incl. /auth/me) to
++   * 20 requests / 15 min per IP. Concurrent refreshes (boot, OAuth callback,
++   * 401 events, uploads) share ONE in-flight request instead of each spending
++   * a slot and eventually getting 429.
++   */
++  const refreshInFlightRef = useRef<Promise<void> | null>(null);
++
++  const refreshUserOnce = useCallback(
+     async (opts?: { announceExpiry?: boolean }) => {
+       try {
+         // Always re-seed the interceptor before reading the session so a token
+@@ -284,9 +324,20 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
+             }
+           }
+ 
++          // The backend authenticates with `Authorization: Bearer <JWT>`
++          // ("No Token Provided" otherwise). Without a token /auth/me can only
++          // 401, so don't spend a rate-limited /auth request on it.
++          const bearer = getSessionToken();
++          if (!bearer) {
++            if (hadSessionRef.current) clearSession();
++            setAuthStatus("unauthenticated");
++            return;
++          }
++
+           const extRes = await fetch(authEndpoints.me, {
+             cache: "no-store",
+             credentials: "include",
++            headers: { Authorization: `Bearer ${bearer}` },
+           });
+           if (extRes.status === 401) {
+             const wasSignedIn = hadSessionRef.current;
+@@ -298,7 +349,24 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
+             }
+             return;
+           }
+-          if (!extRes.ok) return; // transient error: keep current state
++          if (!extRes.ok) {
++            // 429 (auth rate limit) / 5xx: NOT a logout. Keep any restored
++            // session; never leave the app stuck on "loading".
++            if (extRes.status === 429 && !hadSessionRef.current) {
++              showToast(
++                "Too many sign-in requests. Please wait a few minutes and try again.",
++                "error"
++              );
++            }
++            setAuthStatus((prev) =>
++              prev === "loading"
++                ? hadSessionRef.current
++                  ? "authenticated"
++                  : "unauthenticated"
++                : prev
++            );
++            return;
++          }
+ 
+           const payload = await extRes.json();
+           const normalized = normalizeMeResponse(payload);
+@@ -310,14 +378,30 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
+           }
+           if (normalized.token) saveSessionToken(normalized.token);
+ 
++          // The signed-in user's channel: verified GET /channel/me (Bearer).
++          // Edit Channel reads `channel` from context, so it must be real data.
++          let myChannel: ChannelProfile | null = null;
++          try {
++            const chRes = await fetch(channelMeApiUrl(), {
++              cache: "no-store",
++              credentials: "include",
++              headers: { Authorization: `Bearer ${normalized.token || bearer}` },
++            });
++            if (chRes.ok) {
++              myChannel = mapBackendChannel(await chRes.json().catch(() => null));
++            }
++          } catch {
++            /* channel is optional; user stays signed in */
++          }
++
+           hadSessionRef.current = true;
+           setUser(normalized.user);
+-          setChannel(null);
++          setChannel(myChannel);
+           setPreferences(null);
+           setAuthStatus("authenticated");
+           saveSessionSnapshot({
+             user: normalized.user,
+-            channel: null,
++            channel: myChannel,
+             preferences: null,
+             token: normalized.token || getSessionToken(),
+           });
+@@ -385,6 +469,18 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
+     [clearSession, showToast]
+   );
+ 
++  const refreshUser = useCallback(
++    (opts?: { announceExpiry?: boolean }) => {
++      if (refreshInFlightRef.current) return refreshInFlightRef.current;
++      const p = refreshUserOnce(opts).finally(() => {
++        refreshInFlightRef.current = null;
++      });
++      refreshInFlightRef.current = p;
++      return p;
++    },
++    [refreshUserOnce]
++  );
++
+   /* Any 401 from the API means the session is no longer valid. */
+   useEffect(() => {
+     const onUnauthorized = () => refreshUser({ announceExpiry: true });
+@@ -437,6 +533,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
+   // One gentle retry only if we still have no session after boot.
+   useEffect(() => {
+     if (authStatus !== "unauthenticated") return;
++    if (USE_EXTERNAL_BACKEND && !getSessionToken()) return;
+     const t = setTimeout(() => refreshUser(), 800);
+     return () => clearTimeout(t);
+   }, [authStatus, refreshUser]);
+diff --git a/src/lib/api-config.ts b/src/lib/api-config.ts
+index e6f6d82..37f82c9 100644
+--- a/src/lib/api-config.ts
++++ b/src/lib/api-config.ts
+@@ -140,12 +140,10 @@ export function apiUrl(path: string): string {
+  */
+ export const videoUploadCandidates: string[] = USE_EXTERNAL_BACKEND
+   ? [
+-      `${EXTERNAL_API_BASE}/videos/upload`,
++      // VERIFIED live: POST /videos is the backend's only (auth-protected)
++      // video create route. /videos/upload, /video, /upload… all return
++      // "Route '…' not found", so they are no longer tried.
+       `${EXTERNAL_API_BASE}/videos`,
+-      `${EXTERNAL_API_BASE}/video/upload`,
+-      `${EXTERNAL_API_BASE}/video`,
+-      `${EXTERNAL_API_BASE}/upload/video`,
+-      `${EXTERNAL_API_BASE}/upload`,
+     ]
+   : ["/api/upload"];
+ 
+@@ -304,9 +302,12 @@ export function normalizeMeResponse(payload: unknown): NormalizedMe | null {
+           : (root.data as Record<string, unknown>))
+       : root) as Record<string, unknown>;
+ 
++  // MongoDB ObjectIds must stay strings (an all-digit id would otherwise be
++  // coerced to a lossy Number and never match owner ids from the API).
+   const id =
+-    pickNumber(candidate.id, candidate._id, candidate.userId, root.id) ??
+-    (typeof candidate._id === "string" ? candidate._id : 0);
++    pickString(candidate._id, candidate.id, candidate.userId, root.id) ||
++    pickNumber(candidate.id, candidate._id, candidate.userId, root.id) ||
++    0;
+ 
+   const email = pickString(candidate.email, candidate.emailAddress)?.toLowerCase();
+   if (!email) return null;
+@@ -334,6 +335,7 @@ export function normalizeMeResponse(payload: unknown): NormalizedMe | null {
+   const avatarUrl =
+     pickString(
+       candidate.avatarUrl,
++      candidate.profilePhoto, // latest backend field name
+       candidate.avatar,
+       candidate.profilePicture,
+       candidate.picture,
+@@ -401,6 +403,7 @@ export function describeOAuthError(searchParams: URLSearchParams): string {
+     error === "access_denied" ||
+     error === "cancelled" ||
+     error === "cancel" ||
++    error.includes("cancel") || // backend: "google_login_cancelled"
+     searchParams.get("cancelled") !== null ||
+     searchParams.get("cancelledByUser") !== null
+   ) {
+diff --git a/src/lib/backend-adapter.ts b/src/lib/backend-adapter.ts
+index 0eb293a..2144f64 100644
+--- a/src/lib/backend-adapter.ts
++++ b/src/lib/backend-adapter.ts
+@@ -212,9 +212,14 @@ export function adaptVideo(raw: unknown): AdaptedVideo | null {
+       ownerIsObject ? owner.name : "",
+       ownerIsObject ? owner.username : "",
+       v.channelName,
++      (v.channel as Record<string, unknown> | undefined)?.channelName,
+       "BharatTube creator"
+     ),
+-    avatarUrl: str(ownerIsObject ? owner.profilePhoto : "") || null,
++    avatarUrl:
++      str(
++        ownerIsObject ? owner.profilePhoto : "",
++        (v.channel as Record<string, unknown> | undefined)?.logo
++      ) || null,
+     isVerified: Boolean(ownerIsObject && owner.verified),
+     subscriberCount: num(ownerIsObject ? owner.subscribersCount : 0),
+   };
+diff --git a/src/lib/uploader.ts b/src/lib/uploader.ts
+index 1508aed..d9ed741 100644
+--- a/src/lib/uploader.ts
++++ b/src/lib/uploader.ts
+@@ -83,11 +83,64 @@ async function readError(res: Response, fallback: string): Promise<string> {
+  * Returns extra publish fields (title/description/etc.) so the backend can
+  * create the video in ONE request when it expects that.
+  */
++/**
++ * Real, human-readable error from a backend error body. express-validator
++ * replies { message: "Validation Failed", errors: [{ msg, path }] } — the
++ * details are what the user needs to see, not just "Validation Failed".
++ */
++function backendErrorMessage(b: Record<string, any>, fallback: string): string {
++  const base = b.message || b.error || fallback;
++  if (Array.isArray(b.errors) && b.errors.length) {
++    const details = b.errors
++      .map((e: any) =>
++        typeof e === "string" ? e : [e?.path || e?.param, e?.msg || e?.message].filter(Boolean).join(": ")
++      )
++      .filter(Boolean)
++      .join(", ");
++    if (details) return `${base}: ${details}`;
++  }
++  return base;
++}
++
++/**
++ * The backend's multer fileFilter accepts files ONLY by name extension
++ * (/jpg|jpeg|png|webp/ for images, /mp4|mov|avi|mkv|webm/ for videos).
++ * Android pickers often give names without an extension, so send a name the
++ * backend accepts, derived from the real MIME type. Content is unchanged.
++ */
++function backendSafeName(f: File): string {
++  const name = f.name || "upload";
++  const ext = (name.match(/\.([a-z0-9]+)$/i)?.[1] || "").toLowerCase();
++  const isImage = (f.type || "").startsWith("image/");
++  const allowed = isImage
++    ? ["jpg", "jpeg", "png", "webp"]
++    : ["mp4", "mov", "avi", "mkv", "webm"];
++  if (allowed.includes(ext)) return name;
++  const t = (f.type || "").toLowerCase();
++  const byMime = isImage
++    ? t.includes("png") ? "png" : t.includes("webp") ? "webp" : "jpg"
++    : t.includes("webm") ? "webm"
++    : t.includes("quicktime") ? "mov"
++    : t.includes("matroska") ? "mkv"
++    : t.includes("avi") ? "avi"
++    : "mp4";
++  return `${name.replace(/\.[a-z0-9]+$/i, "") || "upload"}.${byMime}`;
++}
++
++/** True only when the backend rejected the multipart FIELD NAME (multer). */
++function isFieldNameRejection(message: string): boolean {
++  return /unexpected field|no file|file (is )?required|video (file )?(is )?required|missing file/i.test(
++    message || ""
++  );
++}
++
+ function uploadFileExternal(
+   file: File,
+   opts: {
+     onProgress?: (p: UploadProgress) => void;
+     extraFields?: Record<string, string>;
++    /** Additional files sent in the SAME request (e.g. { thumbnail: File }). */
++    extraFiles?: Record<string, File | null | undefined>;
+   }
+ ): UploadHandle {
+   let xhr: XMLHttpRequest | null = null;
+@@ -100,7 +153,8 @@ function uploadFileExternal(
+ 
+   const promise = (async (): Promise<UploadedAsset> => {
+     const isImage = file.type.startsWith("image/");
+-    const cap = isImage ? MAX_IMAGE_BYTES : MAX_VIDEO_BYTES;
++    // Backend multer limit (upload.middleware.js): 500 MB per file.
++    const cap = Math.min(isImage ? MAX_IMAGE_BYTES : MAX_VIDEO_BYTES, 500 * 1024 * 1024);
+     if (file.size > cap) {
+       throw new Error(
+         `This file is too large. Maximum size is ${Math.round(cap / (1024 * 1024))} MB.`
+@@ -118,19 +172,33 @@ function uploadFileExternal(
+     // strict multer `.single("video")` parser ("Unexpected field" → 400), so we
+     // send exactly ONE file field and fall through candidates on failure:
+     //   404 -> next endpoint, 400/422 -> next field name, 401/403 -> auth error.
+-    const FIELD_NAMES = ["video", "file", "videoFile"];
++    // Backend (video.routes.js): upload.fields([{ name: "video" }, { name: "thumbnail" }]).
++    const FIELD_NAMES = ["video"];
+     let fieldError = "";
+ 
++    const extraFiles = Object.entries(opts.extraFiles || {}).filter(
++      (entry): entry is [string, File] => entry[1] instanceof File
++    );
++    // With extra files, a strict single-file parser may reject THEM
++    // ("Unexpected field"); retry that field name once without the extras.
++    const EXTRA_MODES = extraFiles.length ? [true, false] : [false];
++
+     let lastError = "Upload failed. Please try again.";
+     outer: for (const endpoint of videoUploadCandidates) {
+       for (const fieldName of FIELD_NAMES) {
++        for (const withExtras of EXTRA_MODES) {
+         if (cancelled) throw new UploadCancelledError();
+ 
++        // Text fields FIRST: multer only exposes req.body fields that arrive
++        // before the file part, and the backend validates them on create.
+         const form = new FormData();
+-        form.append(fieldName, file);
+         for (const [k, v] of Object.entries(opts.extraFields || {})) {
+           if (v !== undefined && v !== null) form.append(k, String(v));
+         }
++        if (withExtras) {
++          for (const [k, f] of extraFiles) form.append(k, f, backendSafeName(f));
++        }
++        form.append(fieldName, file, backendSafeName(file));
+ 
+       const result = await new Promise<
+         { ok: true; data: UploadedAsset } | { ok: false; status: number; message: string }
+@@ -164,13 +232,29 @@ function uploadFileExternal(
+           }
+           if (status >= 200 && status < 300) {
+             const b = (body || {}) as Record<string, any>;
+-            const node = b.data || b.video || b;
++            // { success, data: <video> } | { data: { video } } | { video } | <video>
++            const node =
++              (b.data && typeof b.data === "object" && (b.data.video || b.data)) ||
++              b.video ||
++              b;
+             const url =
+               node.url || node.videoUrl || node.secure_url || node.location || "";
++            const id = node.id || node._id || node.publicId || "";
++            if (!id && !url) {
++              // 2xx but nothing identifies a stored video — do not claim success.
++              resolve({
++                ok: false,
++                status,
++                message:
++                  b.message ||
++                  "The server did not confirm that the video was saved. Please try again.",
++              });
++              return;
++            }
+             resolve({
+               ok: true,
+               data: {
+-                id: String(node.id || node._id || node.publicId || url),
++                id: String(id || url),
+                 url,
+                 filename: file.name,
+                 mimeType: file.type || "application/octet-stream",
+@@ -182,7 +266,10 @@ function uploadFileExternal(
+             resolve({
+               ok: false,
+               status,
+-              message: b.message || b.error || "Upload failed.",
++              message: backendErrorMessage(
++                b,
++                (xhr!.responseText || "").trim().slice(0, 200) || `Upload failed (HTTP ${status}).`
++              ),
+             });
+           }
+         };
+@@ -196,31 +283,36 @@ function uploadFileExternal(
+ 
+       if (result.ok) return result.data;
+       if (result.message === "aborted") throw new UploadCancelledError();
++      if (cancelled) throw new UploadCancelledError();
+       if (result.status === 0) {
+         throw new Error(
+-          "We couldn't reach the server. Please check your connection and try again."
++          "The connection to the server was lost before it confirmed the upload. Please check your connection and try again."
+         );
+       }
+-      if (result.status === 404) {
++      if (result.status === 404 && /route '.*' not found/i.test(result.message)) {
+         lastError = "Upload service was not found on the server.";
+         continue outer; // this endpoint does not exist
+       }
+       if (result.status === 401 || result.status === 403) {
+         throw new Error(
+-          "Your session has expired. Please sign in again, then retry the upload."
++          result.status === 403 && result.message
++            ? result.message
++            : "Your session has expired. Please sign in again, then retry the upload."
+         );
+       }
+       if (result.status === 413) {
+         throw new Error("This file is too large for the server.");
+       }
+-      if (result.status === 400 || result.status === 422) {
++      if (isFieldNameRejection(result.message)) {
+         // Endpoint exists but rejected this multipart field name (strict
+-        // multer-style parsers). Try the next field name for this endpoint.
++        // multer-style parser). Try the next variant for this endpoint.
+         fieldError = result.message || lastError;
+         continue;
+       }
+-      // Endpoint exists but the request is otherwise invalid — no retry helps.
++      // Real server error after the bytes arrived (validation, storage,
++      // database…) — show it exactly; re-uploading will not help.
+       throw new Error(result.message || lastError);
++        }
+       }
+     }
+     // Prefer the field-specific rejection if an endpoint rejected the field.
+@@ -239,6 +331,8 @@ export function uploadFile(
+     maxRetriesPerChunk?: number;
+     /** Publish metadata for one-shot external-backend uploads. */
+     extraFields?: Record<string, string>;
++    /** Extra files for the same one-shot request (e.g. { thumbnail }). */
++    extraFiles?: Record<string, File | null | undefined>;
+   } = {}
+ ): UploadHandle {
+   // External backend: single multipart POST to the real video endpoint.
+@@ -246,6 +340,7 @@ export function uploadFile(
+     return uploadFileExternal(file, {
+       onProgress: opts.onProgress,
+       extraFields: opts.extraFields,
++      extraFiles: opts.extraFiles,
+     });
+   }
+ 
